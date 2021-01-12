@@ -17,14 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -46,6 +49,24 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+const (
+	HeartbeatTimeout = time.Millisecond * 150
+	RPCTimeout       = time.Millisecond * 100
+	ElectionTimeout  = time.Millisecond * 400
+)
+
+type role int
+
+const (
+	Folllower role = 0
+	Candidate role = 1
+	Leader    role = 2
+)
+
+type LogEntry struct {
+	Term int
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -57,15 +78,34 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	electionTimer *time.Timer
+	stopCh        chan bool
+
+	// Persisten
+	role        role
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+
+	// Volatile
+	commitIndex int
+	lateApplied int
+
+	// Volatile on leaders
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.role == Leader
 	return term, isleader
 }
 
@@ -84,7 +124,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,66 +147,11 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+func (rf *Raft) lastLogTermIndex() (int, int) {
+	term := rf.log[len(rf.log)-1].Term
+	index := len(rf.log) - 1
+	return term, index
 }
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -190,7 +174,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -208,11 +191,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.stopCh)
 }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func randElectionTimeout() time.Duration {
+	r := time.Duration(rand.Int63()) % ElectionTimeout
+	return ElectionTimeout + r
+}
+
+func (rf *Raft) resetElectionTimer() {
+	rf.electionTimer.Stop()
+	rf.electionTimer.Reset(randElectionTimeout())
+}
+
+// 转换为Follower
+func (rf *Raft) stepDown(term int) {
+	// DPrintf("%v step down\n", rf.me)
+	rf.currentTerm = term
+	rf.role = Folllower
+	rf.votedFor = -1
+	rf.resetElectionTimer()
 }
 
 //
@@ -228,16 +231,33 @@ func (rf *Raft) killed() bool {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	DPrintf("Make %v\n", me)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.log = make([]LogEntry, 1)
+	rf.role = Folllower
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.electionTimer = time.NewTimer(randElectionTimeout())
+	rf.stopCh = make(chan bool, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go func() {
+		for {
+			select {
+			case <-rf.electionTimer.C:
+				rf.resetElectionTimer()
+				go rf.election()
+			case <-rf.stopCh:
+				return
+			}
+		}
+	}()
 
 	return rf
 }
