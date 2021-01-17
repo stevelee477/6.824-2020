@@ -8,61 +8,168 @@ type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
 
-	// later use
-
-	// PrevLogIndex int
-	// PrevLogTerm  int
-	// entries      []LogEntry
-	// LeaderCommit int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// DPrintf("node %v at term %v response to %v\n", rf.me, rf.currentTerm, args.LeaderId)
+	DPrintf("%v at %v response to %v\n", rf.me, rf.currentTerm, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
 	rf.role = Folllower
 	rf.currentTerm = args.Term
-	reply.Success = true
+	reply.Success = false
 	rf.resetElectionTimer()
+
+	_, lastLogIndex := rf.lastLogTermIndex()
+
+	if args.PrevLogIndex > lastLogIndex {
+		// 缺少log
+		DPrintf("%v miss log %v\n", rf.me, lastLogIndex)
+		reply.ConflictIndex = lastLogIndex + 1 // 要求leader下一次从第一个缺少的记录传输
+		reply.ConflictTerm = -1
+		return
+	}
+
+	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+		prevTerm := rf.log[args.PrevLogIndex].Term
+		for i, e := range rf.log {
+			if e.Term == prevTerm {
+				reply.ConflictIndex = i
+			}
+		}
+		DPrintf("%v conflict log %v\n", rf.me, lastLogIndex)
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		rf.log = rf.log[:args.PrevLogIndex]
+		return
+	}
+
+	i := 0
+	// 找到第一个冲突的log，删除之后的内容，用新的覆盖
+	for ; i < len(args.Entries); i++ {
+		cur := args.PrevLogIndex + 1 + i
+		e := args.Entries[i]
+		if cur <= lastLogIndex && rf.log[cur].Term != e.Term {
+			rf.log = rf.log[:cur]
+			break
+		}
+		if cur >= lastLogIndex {
+			break
+		}
+	}
+
+	for ; i < len(args.Entries); i++ {
+		e := args.Entries[i]
+		rf.log = append(rf.log, e)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		rf.apply()
+	}
+
+	reply.ConflictIndex = args.PrevLogIndex + len(args.Entries) + 1
+	reply.Success = true
+	if len(args.Entries) != 0 {
+		DPrintf("%v got entries up to %v", rf.me, reply.ConflictIndex-1)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int) bool {
 	rf.mu.Lock()
+	prevLogIndex := rf.nextIndex[server] - 1
+	prevLogTerm := rf.log[prevLogIndex].Term
 	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      nil,
+		LeaderCommit: rf.commitIndex,
 	}
+	if len(rf.log) > prevLogIndex {
+		args.Entries = append([]LogEntry{}, rf.log[prevLogIndex+1:]...)
+	}
+	// DPrintf("%v append entries prevIndex %v len %v log len %v\n", server, args.PrevLogIndex, len(args.Entries), len(rf.log))
 	rf.mu.Unlock()
 	reply := AppendEntriesReply{}
 	ch := make(chan bool, 1)
+	timer := time.NewTimer(RPCTimeout)
 	go func() {
 		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 		ch <- ok
 	}()
-	time.Sleep(RPCTimeout)
-	if <-ch {
+	select {
+	case r := <-ch:
+		if !r {
+			return false
+		}
 		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			rf.stepDown(reply.Term)
+		if !reply.Success {
+			if reply.Term > rf.currentTerm {
+				rf.stepDown(reply.Term)
+				rf.mu.Unlock()
+				return false
+			}
+			if reply.ConflictTerm == -1 {
+				// 缺少log
+				rf.nextIndex[server] = reply.ConflictIndex
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			} else {
+				// log冲突
+				firstConflict := reply.ConflictIndex
+				_, lastLogIndex := rf.lastLogTermIndex()
+				for i := 0; i < lastLogIndex; i++ { // 找到冲突term的最后一个log之后的index
+					if rf.log[i].Term != reply.ConflictTerm {
+						continue
+					}
+					for i < lastLogIndex && rf.log[i].Term == reply.ConflictTerm {
+						i++
+					}
+					firstConflict = i
+					break
+				}
+				rf.nextIndex[server] = firstConflict
+			}
+
+		} else {
+			if rf.nextIndex[server] < reply.ConflictIndex {
+				// DPrintf("update %v nextindex %v\n", server, reply.NextIndex)
+				rf.nextIndex[server] = prevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+				rf.updateCommitIndex()
+			}
 		}
 		rf.mu.Unlock()
 		return true
+	case <-timer.C:
+		return false
 	}
-
-	return false
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) appendEntries() {
 	for idx := range rf.peers {
 		if idx == rf.me {
 			rf.resetElectionTimer()
@@ -78,14 +185,54 @@ func (rf *Raft) tick() {
 		select {
 		case <-timer.C:
 			if _, isLeader := rf.GetState(); !isLeader {
-				// DPrintf("%v stop tick\n", rf.me)
+				DPrintf("%v stop tick\n", rf.me)
 				return
 			}
-			// DPrintf("Leader %v tick\n", rf.me)
-			go rf.sendHeartbeat()
+			DPrintf("%v tick\n", rf.me)
+			go rf.appendEntries()
 			timer.Reset(HeartbeatTimeout)
 		case <-rf.stopCh:
 			return
 		}
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	majority := len(rf.peers)/2 + 1
+	n := len(rf.log)
+	for i := n - 1; i > rf.commitIndex; i-- {
+		// 从最后的log向前寻找
+		replicated := 0
+		if rf.log[i].Term == rf.currentTerm {
+			// 只提交当前Term的log
+			for server := range rf.peers {
+				if rf.matchIndex[server] >= i {
+					replicated++
+				}
+			}
+		}
+
+		if replicated >= majority {
+			DPrintf("commit %v\n", i)
+			rf.commitIndex = i
+			rf.apply()
+			break
+		}
+	}
+}
+
+func (rf *Raft) apply() {
+	applied := rf.lastApplied
+	logs := append([]LogEntry{}, rf.log[applied+1:rf.commitIndex+1]...)
+	rf.lastApplied = rf.commitIndex
+
+	for idx, l := range logs {
+		msg := ApplyMsg{
+			Command:      l.Command,
+			CommandIndex: applied + idx + 1,
+			CommandValid: true,
+		}
+		DPrintf("%v applied log %v\n", rf.me, applied+idx+1)
+		rf.applyCh <- msg
 	}
 }

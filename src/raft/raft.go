@@ -52,7 +52,7 @@ type ApplyMsg struct {
 const (
 	HeartbeatTimeout = time.Millisecond * 150
 	RPCTimeout       = time.Millisecond * 100
-	ElectionTimeout  = time.Millisecond * 400
+	ElectionTimeout  = time.Millisecond * 300
 )
 
 type role int
@@ -64,7 +64,8 @@ const (
 )
 
 type LogEntry struct {
-	Term int
+	Term    int
+	Command interface{}
 }
 
 type Raft struct {
@@ -73,6 +74,8 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -89,7 +92,7 @@ type Raft struct {
 
 	// Volatile
 	commitIndex int
-	lateApplied int
+	lastApplied int
 
 	// Volatile on leaders
 	nextIndex  []int
@@ -168,11 +171,21 @@ func (rf *Raft) lastLogTermIndex() (int, int) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term := rf.currentTerm
+	_, lastIndex := rf.lastLogTermIndex()
+	index := lastIndex + 1
+	isLeader := rf.role == Leader
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{
+			Term:    term,
+			Command: command,
+		})
+		DPrintf("%v start log %v\n", rf.me, command)
+		rf.matchIndex[rf.me] = index
+	}
 
 	return index, term, isLeader
 }
@@ -218,6 +231,18 @@ func (rf *Raft) stepDown(term int) {
 	rf.resetElectionTimer()
 }
 
+// 成为Leader后初始化
+func (rf *Raft) initLeader() {
+	_, lastLogIndex := rf.lastLogTermIndex()
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	for idx := range rf.nextIndex {
+		rf.nextIndex[idx] = lastLogIndex + 1
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -237,12 +262,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	rf.log = make([]LogEntry, 1)
+	m := sync.Mutex{}
+	m.Lock()
+	rf.applyCond = sync.NewCond(&m)
+
+	rf.log = append(rf.log, LogEntry{
+		Term:    0,
+		Command: nil,
+	}) // log从一开始
 	rf.role = Folllower
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	rf.stopCh = make(chan bool, 1)
+	rf.applyCh = applyCh
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -252,7 +288,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			select {
 			case <-rf.electionTimer.C:
 				rf.resetElectionTimer()
-				go rf.election()
+				rf.election()
 			case <-rf.stopCh:
 				return
 			}
