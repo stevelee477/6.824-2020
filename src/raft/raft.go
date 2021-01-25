@@ -18,11 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -52,7 +54,7 @@ type ApplyMsg struct {
 const (
 	HeartbeatTimeout = time.Millisecond * 150
 	RPCTimeout       = time.Millisecond * 100
-	ElectionTimeout  = time.Millisecond * 300
+	ElectionTimeout  = time.Millisecond * 400
 )
 
 type role int
@@ -120,12 +122,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -137,17 +140,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		DPrintf("read persist error\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 func (rf *Raft) lastLogTermIndex() (int, int) {
@@ -185,6 +191,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		DPrintf("%v start log %v\n", rf.me, command)
 		rf.matchIndex[rf.me] = index
+		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -228,7 +235,7 @@ func (rf *Raft) stepDown(term int) {
 	rf.currentTerm = term
 	rf.role = Folllower
 	rf.votedFor = -1
-	rf.resetElectionTimer()
+	rf.persist()
 }
 
 // 成为Leader后初始化
@@ -283,12 +290,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.applyDeamon()
+
 	go func() {
 		for {
 			select {
 			case <-rf.electionTimer.C:
 				rf.resetElectionTimer()
-				rf.election()
+				go rf.election()
 			case <-rf.stopCh:
 				return
 			}

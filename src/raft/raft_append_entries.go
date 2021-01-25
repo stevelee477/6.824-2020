@@ -36,9 +36,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
+	} else if args.Term > rf.currentTerm {
+		rf.stepDown(args.Term)
 	}
-	rf.role = Folllower
-	rf.currentTerm = args.Term
 	reply.Success = false
 	rf.resetElectionTimer()
 
@@ -46,36 +46,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex > lastLogIndex {
 		// 缺少log
-		DPrintf("%v miss log %v\n", rf.me, lastLogIndex)
+		DPrintf("%v miss log %v\n", rf.me, lastLogIndex+1)
 		reply.ConflictIndex = lastLogIndex + 1 // 要求leader下一次从第一个缺少的记录传输
 		reply.ConflictTerm = -1
+		rf.persist()
 		return
 	}
 
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-		prevTerm := rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		for i, e := range rf.log {
-			if e.Term == prevTerm {
+			if e.Term == reply.ConflictTerm {
 				reply.ConflictIndex = i
+				break
 			}
 		}
-		DPrintf("%v conflict log %v\n", rf.me, lastLogIndex)
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
-		rf.log = rf.log[:args.PrevLogIndex]
+		DPrintf("%v conflict log %v\n", rf.me, args.PrevLogIndex)
+		// rf.log = rf.log[:args.PrevLogIndex]
+		// rf.persist()
 		return
 	}
 
+	reply.Success = true
+	if args.PrevLogIndex+len(rf.log) <= rf.commitIndex {
+		// 重复log
+		return
+	}
 	i := 0
 	// 找到第一个冲突的log，删除之后的内容，用新的覆盖
 	for ; i < len(args.Entries); i++ {
 		cur := args.PrevLogIndex + 1 + i
 		e := args.Entries[i]
 		if cur <= lastLogIndex && rf.log[cur].Term != e.Term {
+			DPrintf("%v conflict at %v origin %v after %v\n", rf.me, cur, rf.log[cur], e)
 			rf.log = rf.log[:cur]
 			break
 		}
-		if cur >= lastLogIndex {
+		if cur > lastLogIndex {
 			break
 		}
 	}
@@ -87,13 +95,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		DPrintf("%v update commitIndex %v\n", rf.me, rf.commitIndex)
 		rf.apply()
 	}
 
-	reply.ConflictIndex = args.PrevLogIndex + len(args.Entries) + 1
-	reply.Success = true
+	rf.persist()
+
 	if len(args.Entries) != 0 {
-		DPrintf("%v got entries up to %v", rf.me, reply.ConflictIndex-1)
+		DPrintf("%v got entries up to %v", rf.me, args.PrevLogIndex+len(args.Entries))
 	}
 }
 
@@ -114,59 +123,73 @@ func (rf *Raft) sendAppendEntries(server int) bool {
 	}
 	// DPrintf("%v append entries prevIndex %v len %v log len %v\n", server, args.PrevLogIndex, len(args.Entries), len(rf.log))
 	rf.mu.Unlock()
-	reply := AppendEntriesReply{}
-	ch := make(chan bool, 1)
-	timer := time.NewTimer(RPCTimeout)
-	go func() {
-		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-		ch <- ok
-	}()
-	select {
-	case r := <-ch:
-		if !r {
-			return false
-		}
-		rf.mu.Lock()
-		if !reply.Success {
-			if reply.Term > rf.currentTerm {
-				rf.stepDown(reply.Term)
+	count := 0
+	for {
+		count++
+		reply := AppendEntriesReply{}
+		ch := make(chan bool, 1)
+		timer := time.NewTimer(RPCTimeout)
+		go func() {
+			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+			ch <- ok
+		}()
+		select {
+		case r := <-ch:
+			rf.mu.Lock()
+			if rf.role != Leader {
 				rf.mu.Unlock()
 				return false
 			}
-			if reply.ConflictTerm == -1 {
-				// 缺少log
-				rf.nextIndex[server] = reply.ConflictIndex
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-			} else {
-				// log冲突
-				firstConflict := reply.ConflictIndex
-				_, lastLogIndex := rf.lastLogTermIndex()
-				for i := 0; i < lastLogIndex; i++ { // 找到冲突term的最后一个log之后的index
-					if rf.log[i].Term != reply.ConflictTerm {
-						continue
-					}
-					for i < lastLogIndex && rf.log[i].Term == reply.ConflictTerm {
-						i++
-					}
-					firstConflict = i
-					break
+			if !r {
+				rf.mu.Unlock()
+				continue
+			}
+			if !reply.Success {
+				if reply.Term > rf.currentTerm {
+					rf.stepDown(reply.Term)
+					rf.mu.Unlock()
+					return false
 				}
-				rf.nextIndex[server] = firstConflict
+				if reply.ConflictIndex == 0 {
+					return false
+				}
+				if reply.ConflictTerm == -1 {
+					// 缺少log
+					rf.nextIndex[server] = reply.ConflictIndex
+					rf.matchIndex[server] = rf.nextIndex[server] - 1
+				} else {
+					// log冲突
+					conflictIndex := reply.ConflictIndex
+					_, lastLogIndex := rf.lastLogTermIndex()
+					for i := 0; i < lastLogIndex; i++ { // 找到冲突term的最后一个log之后的index
+						if rf.log[i].Term == reply.ConflictTerm {
+							for i <= lastLogIndex && rf.log[i].Term == reply.ConflictTerm {
+								i++
+							}
+							conflictIndex = i
+							break
+						}
+					}
+					rf.nextIndex[server] = conflictIndex
+				}
+				DPrintf("update %v nextindex %v\n", server, rf.nextIndex[server])
+			} else {
+				if rf.nextIndex[server] < prevLogIndex+len(args.Entries)+1 {
+					DPrintf("update %v nextindex %v\n", server, prevLogIndex+len(args.Entries)+1)
+					rf.nextIndex[server] = prevLogIndex + len(args.Entries) + 1
+					rf.matchIndex[server] = rf.nextIndex[server] - 1
+					if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
+						rf.updateCommitIndex()
+					}
+				}
 			}
-
-		} else {
-			if rf.nextIndex[server] < reply.ConflictIndex {
-				// DPrintf("update %v nextindex %v\n", server, reply.NextIndex)
-				rf.nextIndex[server] = prevLogIndex + len(args.Entries) + 1
-				rf.matchIndex[server] = rf.nextIndex[server] - 1
-				rf.updateCommitIndex()
-			}
+			rf.mu.Unlock()
+			return true
+		case <-timer.C:
+			return false
 		}
-		rf.mu.Unlock()
-		return true
-	case <-timer.C:
-		return false
 	}
+	return false
 }
 
 func (rf *Raft) appendEntries() {
@@ -215,7 +238,8 @@ func (rf *Raft) updateCommitIndex() {
 		if replicated >= majority {
 			DPrintf("commit %v\n", i)
 			rf.commitIndex = i
-			rf.apply()
+			// rf.apply()
+			rf.applyCond.Broadcast()
 			break
 		}
 	}
@@ -226,6 +250,9 @@ func (rf *Raft) apply() {
 	logs := append([]LogEntry{}, rf.log[applied+1:rf.commitIndex+1]...)
 	rf.lastApplied = rf.commitIndex
 
+	DPrintf("%v start apply %v to %v\n", rf.me, applied+1, rf.commitIndex)
+	// DPrintf("%v\n", logs)
+
 	for idx, l := range logs {
 		msg := ApplyMsg{
 			Command:      l.Command,
@@ -234,5 +261,29 @@ func (rf *Raft) apply() {
 		}
 		DPrintf("%v applied log %v\n", rf.me, applied+idx+1)
 		rf.applyCh <- msg
+	}
+}
+
+func (rf *Raft) applyDeamon() {
+	for {
+		rf.applyCond.Wait()
+		rf.mu.Lock()
+		applied := rf.lastApplied
+		logs := append([]LogEntry{}, rf.log[applied+1:rf.commitIndex+1]...)
+		rf.lastApplied = rf.commitIndex
+
+		DPrintf("%v start apply %v to %v\n", rf.me, applied+1, rf.commitIndex)
+		// DPrintf("%v\n", logs)
+
+		for idx, l := range logs {
+			msg := ApplyMsg{
+				Command:      l.Command,
+				CommandIndex: applied + idx + 1,
+				CommandValid: true,
+			}
+			DPrintf("%v applied log %v\n", rf.me, applied+idx+1)
+			rf.applyCh <- msg
+		}
+		rf.mu.Unlock()
 	}
 }

@@ -24,6 +24,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
+	rf.persist()
 
 	if args.Term < rf.currentTerm {
 		return
@@ -53,23 +54,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.role = Folllower
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.resetElectionTimer()
+	rf.persist()
 	DPrintf("%v vote to %v\n", rf.me, args.CandidateId)
 	return
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	timer := time.NewTimer(RPCTimeout)
-	ch := make(chan bool, 1)
-	go func() {
-		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-		ch <- ok
-	}()
-	select {
-	case r := <-ch:
-		return r
-	case <-timer.C:
-		return false
+	count := 1
+	for {
+		count++
+		timer := time.NewTimer(RPCTimeout)
+		ch := make(chan bool, 1)
+		r := RequestVoteReply{}
+		go func() {
+			ok := rf.peers[server].Call("Raft.RequestVote", args, &r)
+			ch <- ok
+		}()
+		select {
+		case ok := <-ch:
+			rf.mu.Lock()
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return false
+			}
+			rf.mu.Unlock()
+			if ok {
+				reply.Term = r.Term
+				reply.VoteGranted = r.VoteGranted
+				return ok
+			}
+		case <-timer.C:
+			continue
+		case <-rf.stopCh:
+			return false
+		}
 	}
+	return false
 }
 
 func (rf *Raft) election() {
@@ -98,25 +119,16 @@ func (rf *Raft) election() {
 
 	grantedCount := 1
 	voteCount := 1
-	votesCh := make(chan bool, len(rf.peers))
+	votesCh := make(chan RequestVoteReply, len(rf.peers))
 	for idx := range rf.peers {
 		if idx == rf.me {
 			rf.resetElectionTimer()
 			continue
 		}
-		go func(ch chan bool, idx int) {
+		go func(ch chan RequestVoteReply, idx int) {
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(idx, &args, &reply)
-			ch <- reply.VoteGranted
-			if reply.Term > args.Term {
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.stepDown(reply.Term)
-					rf.mu.Unlock()
-					return
-				}
-				rf.mu.Unlock()
-			}
+			ch <- reply
 		}(votesCh, idx)
 	}
 
@@ -124,16 +136,34 @@ L:
 	for {
 		select {
 		case r := <-votesCh:
+			rf.mu.Lock()
+			if rf.role != Candidate {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+			if r.Term > args.Term {
+				rf.mu.Lock()
+				if r.Term > rf.currentTerm {
+					rf.stepDown(r.Term)
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+			}
 			voteCount++
-			if r == true {
+			if r.VoteGranted == true {
 				grantedCount++
-				rf.resetElectionTimer()
 			}
 			if voteCount == len(rf.peers) || grantedCount > len(rf.peers)/2 || voteCount-grantedCount > len(rf.peers)/2 {
 				break L
 			}
 		case <-timer.C:
 			DPrintf("%v election timeout\n", rf.me)
+			rf.mu.Lock()
+			rf.role = Folllower
+			// rf.votedFor = -1
+			rf.mu.Unlock()
 			return
 		case <-rf.stopCh:
 			return
@@ -141,7 +171,7 @@ L:
 	}
 
 	if grantedCount <= len(rf.peers)/2 {
-		DPrintf("%v failed become leader\n", rf.me)
+		DPrintf("%v failed become leader with granted %v\n", rf.me, grantedCount)
 		rf.mu.Lock()
 		rf.role = Folllower
 		rf.mu.Unlock()
@@ -152,6 +182,7 @@ L:
 	if args.Term == rf.currentTerm && rf.role == Candidate {
 		DPrintf("%v become leader\n", rf.me)
 		rf.initLeader()
+		// rf.resetElectionTimer() //?????
 		rf.role = Leader
 		go rf.tick()
 	}
