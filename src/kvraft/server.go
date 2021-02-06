@@ -1,15 +1,21 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
+
+const (
+	WaitCmdTimeout = time.Millisecond * 500
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +24,21 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type NotifyMsg struct {
+	Err   Err
+	Value string
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	MsgId    int64
+	Seq      int64
+	ClientId int64
+	Op       string
+	Key      string
+	Value    string
 }
 
 type KVServer struct {
@@ -35,15 +51,116 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	stopCh   chan bool
+	data     map[string]string
+	lastSeq  map[int64]int64
+	notifyCh map[int64]chan NotifyMsg
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		MsgId:    nrand(),
+		Seq:      args.Seq,
+		Key:      args.Key,
+		Op:       "Get",
+		ClientId: args.ClientId,
+	}
+	res := kv.waitCmdApply(op)
+	reply.Err = res.Err
+	reply.Value = res.Value
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		MsgId:    nrand(),
+		Seq:      args.Seq,
+		Key:      args.Key,
+		Value:    args.Value,
+		Op:       args.Op,
+		ClientId: args.ClientId,
+	}
+	res := kv.waitCmdApply(op)
+	reply.Err = res.Err
+	return
+}
+
+func (kv *KVServer) waitCmdApply(op Op) (res NotifyMsg) {
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		res.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("wait cmd %v %v clientid %v seq %v\n", op.Op, op.Key, op.ClientId, op.Seq)
+
+	kv.mu.Lock()
+	ch := make(chan NotifyMsg, 1)
+	kv.notifyCh[op.MsgId] = ch
+	kv.mu.Unlock()
+
+	t := time.NewTimer(WaitCmdTimeout)
+	defer t.Stop()
+	select {
+	case res = <-ch:
+		DPrintf("applied cmd %v %v clientid %v seq %v\n", op.Op, op.Key, op.ClientId, op.Seq)
+		kv.mu.Lock()
+		delete(kv.notifyCh, op.MsgId)
+		kv.mu.Unlock()
+		return
+	case <-t.C:
+		DPrintf("timeout wait cmd %v %v clientid %v seq %v\n", op.Op, op.Key, op.ClientId, op.Seq)
+		res.Err = ErrApplyTimeout
+		kv.mu.Lock()
+		delete(kv.notifyCh, op.MsgId)
+		kv.mu.Unlock()
+		return
+	}
+}
+
+func (kv *KVServer) applyDeamon() {
+	for {
+		select {
+		case <-kv.stopCh:
+			return
+
+		case msg := <-kv.applyCh:
+			// index := msg.CommandIndex
+			op := msg.Command.(Op)
+
+			kv.mu.Lock()
+			isRepeated := op.Seq <= kv.lastSeq[op.ClientId]
+			if isRepeated {
+				DPrintf("duplicated %v %v\n", op.Op, op.Key)
+			}
+			switch op.Op {
+			case "Put":
+				if !isRepeated {
+					kv.data[op.Key] = op.Value
+					kv.lastSeq[op.ClientId] = op.Seq
+					DPrintf("lastSeq %v to %v\n", op.ClientId, kv.lastSeq[op.ClientId])
+				}
+			case "Append":
+				if !isRepeated {
+					v, _ := kv.data[op.Key]
+					kv.data[op.Key] = v + op.Value
+					kv.lastSeq[op.ClientId] = op.Seq
+					DPrintf("lastSeq %v to %v\n", op.ClientId, kv.lastSeq[op.ClientId])
+				}
+			case "Get":
+			}
+
+			if ch, ok := kv.notifyCh[op.MsgId]; ok {
+				v, _ := kv.data[op.Key]
+				ch <- NotifyMsg{
+					Err:   OK,
+					Value: v,
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
 }
 
 //
@@ -60,6 +177,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.stopCh)
 }
 
 func (kv *KVServer) killed() bool {
@@ -96,6 +214,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.stopCh = make(chan bool, 1)
+	kv.data = make(map[string]string)
+	kv.lastSeq = make(map[int64]int64)
+	kv.notifyCh = make(map[int64]chan NotifyMsg)
+
+	go kv.applyDeamon()
 
 	return kv
 }
