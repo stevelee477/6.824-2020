@@ -69,7 +69,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	if args.PrevLogIndex+len(rf.log) <= rf.commitIndex {
+	if args.PrevLogIndex+len(args.Entries) <= rf.commitIndex {
 		// 重复log
 		return
 	}
