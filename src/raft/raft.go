@@ -52,9 +52,10 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 const (
-	HeartbeatTimeout = time.Millisecond * 150
-	RPCTimeout       = time.Millisecond * 100
-	ElectionTimeout  = time.Millisecond * 400
+	HeartbeatTimeout = time.Millisecond * 100
+	RPCTimeout       = time.Millisecond * 50
+	ElectionTimeout  = time.Millisecond * 300
+	ApplyInterval    = time.Millisecond * 100
 )
 
 type role int
@@ -77,7 +78,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
-	applyCond *sync.Cond
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -85,6 +85,8 @@ type Raft struct {
 
 	electionTimer *time.Timer
 	stopCh        chan bool
+	notifyApplyCh chan struct{}
+	applyTimer    *time.Timer
 
 	// Persisten
 	role        role
@@ -99,6 +101,10 @@ type Raft struct {
 	// Volatile on leaders
 	nextIndex  []int
 	matchIndex []int
+
+	//Snapshot
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 // return currentTerm and whether this server
@@ -119,15 +125,24 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
+
+func (rf *Raft) getPersistState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
+	return data
+}
+
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	data := rf.getPersistState()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -144,21 +159,30 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var commitIndex int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var log []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&commitIndex) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("read persist error\n")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.commitIndex = commitIndex
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
 func (rf *Raft) lastLogTermIndex() (int, int) {
 	term := rf.log[len(rf.log)-1].Term
-	index := len(rf.log) - 1
+	index := rf.lastIncludedIndex + len(rf.log) - 1
 	return term, index
 }
 
@@ -250,6 +274,16 @@ func (rf *Raft) initLeader() {
 	}
 }
 
+func (rf *Raft) getLogByIndex(logIndex int) LogEntry {
+	idx := logIndex - rf.lastIncludedIndex
+	return rf.log[idx]
+}
+
+func (rf *Raft) getIndex(logIndex int) int {
+	idx := logIndex - rf.lastIncludedIndex
+	return idx
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -271,7 +305,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	m := sync.Mutex{}
 	m.Lock()
-	rf.applyCond = sync.NewCond(&m)
 
 	rf.log = append(rf.log, LogEntry{
 		Term:    0,
@@ -282,6 +315,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	rf.stopCh = make(chan bool, 1)
+	rf.applyTimer = time.NewTimer(ApplyInterval)
+	rf.notifyApplyCh = make(chan struct{}, 100)
 	rf.applyCh = applyCh
 
 	rf.commitIndex = 0
@@ -290,7 +325,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.applyDeamon()
+	// apply log
+	go func() {
+		for {
+			select {
+			case <-rf.stopCh:
+				return
+			case <-rf.applyTimer.C:
+				rf.notifyApplyCh <- struct{}{}
+			case <-rf.notifyApplyCh:
+				rf.apply()
+			}
+		}
+	}()
 
 	go func() {
 		for {

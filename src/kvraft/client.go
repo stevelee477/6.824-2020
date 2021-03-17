@@ -5,6 +5,8 @@ import (
 	"math/big"
 	"sync/atomic"
 
+	"time"
+
 	"../labrpc"
 )
 
@@ -58,6 +60,8 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.servers[leaderId].Call("KVServer.Get", &args, &reply)
 
 		if !ok {
+			time.Sleep(time.Millisecond * 20)
+			leaderId = (leaderId + 1) % len(ck.servers)
 			continue
 		}
 		switch reply.Err {
@@ -102,6 +106,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.servers[leaderId].Call("KVServer.PutAppend", &args, &reply)
 
 		if !ok {
+			time.Sleep(time.Millisecond * 20)
 			leaderId = (leaderId + 1) % len(ck.servers)
 			continue
 		}

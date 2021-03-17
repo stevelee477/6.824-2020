@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -49,12 +50,17 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	stopCh   chan bool
 	data     map[string]string
 	lastSeq  map[int64]int64
 	notifyCh map[int64]chan NotifyMsg
+
+	lockStart time.Time
+	lockEnd   time.Time
+	lockName  string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -120,17 +126,24 @@ func (kv *KVServer) waitCmdApply(op Op) (res NotifyMsg) {
 }
 
 func (kv *KVServer) applyDeamon() {
-	for {
+	for !kv.killed() {
 		select {
 		case <-kv.stopCh:
 			return
 
 		case msg := <-kv.applyCh:
 			// index := msg.CommandIndex
+			if !msg.CommandValid {
+				//是一个Snapshot
+				kv.mu.Lock()
+				kv.readPersist(kv.persister.ReadSnapshot())
+				kv.mu.Unlock()
+				continue
+			}
 			op := msg.Command.(Op)
 
 			kv.mu.Lock()
-			isRepeated := op.Seq <= kv.lastSeq[op.ClientId]
+			isRepeated := op.Seq == kv.lastSeq[op.ClientId]
 			if isRepeated {
 				DPrintf("duplicated %v %v\n", op.Op, op.Key)
 			}
@@ -151,6 +164,7 @@ func (kv *KVServer) applyDeamon() {
 			case "Get":
 			}
 
+			kv.saveSnapshot(msg.CommandIndex)
 			if ch, ok := kv.notifyCh[op.MsgId]; ok {
 				v, _ := kv.data[op.Key]
 				ch <- NotifyMsg{
@@ -160,6 +174,46 @@ func (kv *KVServer) applyDeamon() {
 			}
 			kv.mu.Unlock()
 		}
+	}
+}
+
+func (kv *KVServer) saveSnapshot(appliedId int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() > kv.maxraftstate*9/10 {
+		DPrintf("triggered snapshot")
+		data := kv.encodeSnapshot()
+		kv.rf.SaveSnapshot(appliedId, data)
+	}
+	return
+}
+
+func (kv *KVServer) encodeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.lastSeq)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvData map[string]string
+	var lastSeq map[int64]int64
+
+	if d.Decode(&kvData) != nil ||
+		d.Decode(&lastSeq) != nil {
+		log.Fatal("kv read persist err")
+	} else {
+		kv.data = kvData
+		kv.lastSeq = lastSeq
 	}
 }
 
@@ -207,6 +261,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -219,6 +274,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.lastSeq = make(map[int64]int64)
 	kv.notifyCh = make(map[int64]chan NotifyMsg)
+	kv.readPersist(kv.persister.ReadSnapshot())
 
 	go kv.applyDeamon()
 

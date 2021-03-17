@@ -61,9 +61,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	count := 1
-	for {
-		count++
+	for !rf.killed() {
 		timer := time.NewTimer(RPCTimeout)
 		ch := make(chan bool, 1)
 		r := RequestVoteReply{}
@@ -73,6 +71,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		}()
 		select {
 		case ok := <-ch:
+			if !ok {
+				time.Sleep(time.Millisecond * 10)
+				continue
+			}
 			rf.mu.Lock()
 			if rf.role != Candidate {
 				rf.mu.Unlock()
@@ -182,7 +184,6 @@ L:
 	if args.Term == rf.currentTerm && rf.role == Candidate {
 		DPrintf("%v become leader\n", rf.me)
 		rf.initLeader()
-		// rf.resetElectionTimer() //?????
 		rf.role = Leader
 		go rf.tick()
 	}
